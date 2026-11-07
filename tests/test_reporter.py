@@ -36,7 +36,8 @@ def test_reports_do_not_leak_other_clients_items():
 
 def test_overdue_uses_report_date():
     _, (k, _) = sample(date(2026, 11, 12))
-    assert {"K-06", "K-02", "K-03", "K-04"} <= {i["id"] for i in k.overdue}
+    assert {"K-06", "K-02", "K-03"} <= {i["id"] for i in k.overdue}
+    assert "K-04" not in {i["id"] for i in k.overdue}          # internal item
     _, (k0, _) = sample(date(2026, 11, 9))
     assert k0.overdue == []
 
@@ -89,3 +90,36 @@ def test_tracker_status_worse_than_reported_is_flagged():
     t["summary"].loc[1, "status"] = "Green"      # marked Green although a High item (L-04, due 13 Nov) is overdue on 20 Nov
     l = build_reports(t, date(2026, 11, 20))[1]
     assert l.health == "Green" and any("suggest" in w for w in l.warnings)
+
+
+def test_internal_items_and_text_never_reach_a_client_report():
+    _, (k, l) = sample(date(2026, 11, 12))
+    page = render_html(k) + render_markdown(k)
+    for secret in ("K-04", "K-07", "L-03", "leave", "AI cost"):
+        assert secret not in page, secret
+    other = render_html(l) + render_markdown(l)          # one client must never see the other client's project
+    assert "Kavach" not in other and "Nirmal" not in other
+    assert any(i["id"] == "K-04" for i in k.all_items)         # still visible in the internal dashboard data
+
+
+def test_client_facing_update_is_used_and_missing_one_warns():
+    t, (k, _) = sample()
+    assert k.progress.startswith("Testing found 4 wrong EMI")
+    t["summary"] = t["summary"].drop(columns=["client_update"])
+    k2 = build_reports(t, date(2026, 11, 9))[0]
+    assert any("Client-facing update" in w for w in k2.warnings)
+
+
+def test_two_files_with_same_project_later_upload_wins_and_is_reported():
+    data = SAMPLE.read_bytes()
+    t = load_tracker([("a.xlsx", data), ("b.xlsx", data)])
+    assert len(t["summary"]) == 2 and t["notes"]
+    assert [x["Read as"] for x in t["sources"]].count("Summary") == 2
+
+
+def test_changed_upload_changes_the_report():
+    t, _ = sample()
+    t["summary"].loc[0, "status"] = "Green"
+    t["summary"].loc[0, "client_update"] = "Everything fixed."
+    k = build_reports(t, date(2026, 11, 9))[0]
+    assert "Everything fixed." in render_html(k)

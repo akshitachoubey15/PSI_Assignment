@@ -18,6 +18,7 @@ CLOSED = {"closed", "done", "mitigated", "resolved", "complete", "completed"}
 
 # column name (lower-case, as found in the file) contains ...  ->  internal name
 SUMMARY_ALIASES = [
+    ("client-facing", "client_update"), ("client update", "client_update"),
     ("rag", "status"), ("status", "status"), ("project", "project"), ("client", "client"),
     ("current phase", "phase"), ("phase", "phase"),
     ("next milestone", "next_milestone"), ("milestone date", "milestone_date"),
@@ -28,7 +29,7 @@ RISK_ALIASES = [
     ("id", "id"), ("project", "project"), ("type", "type"), ("description", "description"),
     ("probability", "probability"), ("impact", "impact"), ("rating", "rating"),
     ("owner", "owner"), ("mitigation", "action"), ("action", "action"),
-    ("due", "due"), ("status", "status"),
+    ("due", "due"), ("visib", "visibility"), ("status", "status"),
 ]
 MILESTONE_ALIASES = [("project", "project"), ("milestone", "milestone"), ("date", "date"), ("status", "status")]
 
@@ -54,6 +55,8 @@ class ClientReport:
     decisions: list[str] = field(default_factory=list)
     next_week: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    main_issue: str = ""
+    all_items: list[dict] = field(default_factory=list)
 
 
 # ----------------------------------------------------------------- loading
@@ -110,37 +113,60 @@ def load_tracker(files: list[tuple[str, bytes]]) -> dict:
         for sname, df in _read_any(name, data).items():
             sheets[f"{name}::{sname}"] = df
 
-    summary = risks = milestones = None
+    summaries, risk_frames, milestone_frames, sources, ignored = [], [], [], [], []
     title_text = ""
-    ignored = []
     for key, raw in sheets.items():
+        fname, sname = key.split("::", 1)
         if raw.empty:
-            ignored.append(key.split("::")[0])
+            ignored.append(f"{fname} / {sname}")
             continue
         flat = " ".join(str(x) for x in raw.head(15).fillna("").values.ravel()).lower()
-        title_text += " " + " ".join(str(x) for x in raw.head(3).fillna("").values.ravel())
         try:
             if "rag" in flat and "next milestone" in flat:
-                summary = _frame(raw, SUMMARY_ALIASES, "project")
+                df, kind = _frame(raw, SUMMARY_ALIASES, "project"), "Summary"
+                summaries.append(df)
             elif "probability" in flat and "impact" in flat:
-                risks = _frame(raw, RISK_ALIASES, "description")
+                df, kind = _frame(raw, RISK_ALIASES, "description"), "Risks and issues"
+                risk_frames.append(df)
             elif "milestone" in flat and "date" in flat and "next milestone" not in flat:
-                milestones = _frame(raw, MILESTONE_ALIASES, "milestone")
+                df, kind = _frame(raw, MILESTONE_ALIASES, "milestone"), "Milestones"
+                milestone_frames.append(df)
             else:
-                ignored.append(key)
+                ignored.append(f"{fname} / {sname}")
+                continue
         except TrackerError:
-            ignored.append(key)
-    if summary is None:
+            ignored.append(f"{fname} / {sname}")
+            continue
+        title_text += " " + " ".join(str(x) for x in raw.head(3).fillna("").values.ravel())
+        sources.append({"File": fname, "Sheet": sname, "Read as": kind, "Rows": len(df)})
+
+    if not summaries:
         raise TrackerError("No Summary sheet found. It needs columns such as Project, Client, Status (RAG), Next milestone, Milestone date.")
+    if not risk_frames:
+        raise TrackerError("No 'Risks and Issues' sheet found. It needs columns such as Description, Probability, Impact, Owner, Due date, Status.")
+    summary = pd.concat(summaries, ignore_index=True)
+    risks = pd.concat(risk_frames, ignore_index=True)
+    milestones = pd.concat(milestone_frames, ignore_index=True) if milestone_frames else None
+    notes = []
+    # the same project in two files: the file uploaded last wins (and we say so)
+    dup = summary["project"].astype(str).str.strip().str.lower().duplicated(keep="last")
+    if dup.any():
+        notes.append("Project listed in more than one file (" + ", ".join(summary.loc[dup, "project"].astype(str)) + "): the later upload was used.")
+        summary = summary[~dup].reset_index(drop=True)
+    if "id" in risks.columns:
+        key_ = risks["id"].astype(str).str.strip()
+        d2 = key_.duplicated(keep="last") & key_.ne("nan") & key_.ne("")
+        if d2.any():
+            notes.append(f"{int(d2.sum())} risk/issue row(s) with the same ID in several files: the later upload was used.")
+            risks = risks[~d2].reset_index(drop=True)
     for need in ("project", "client", "status"):
         if need not in summary.columns:
             raise TrackerError(f"The Summary sheet is missing the '{need}' column.")
-    if risks is None:
-        raise TrackerError("No 'Risks and Issues' sheet found. It needs columns such as Description, Probability, Impact, Owner, Due date, Status.")
     for need in ("project", "description", "probability", "impact"):
         if need not in risks.columns:
             raise TrackerError(f"The Risks and Issues sheet is missing the '{need}' column.")
-    return {"summary": summary, "risks": risks, "milestones": milestones, "title_text": title_text, "ignored": ignored}
+    return {"summary": summary, "risks": risks, "milestones": milestones, "title_text": title_text,
+            "ignored": ignored, "sources": sources, "notes": notes}
 
 
 def detect_as_of(tracker: dict) -> date | None:
@@ -188,22 +214,31 @@ def fmt(d: date | None) -> str:
     return d.strftime("%a %d %b") if d else "date not set"
 
 
-def build_reports(tracker: dict, as_of: date) -> list[ClientReport]:
-    summary, risks, ms = tracker["summary"], tracker["risks"], tracker["milestones"]
+def normalized_items(tracker: dict) -> list[dict]:
     items = []
-    for _, r in risks.iterrows():
+    for _, r in tracker["risks"].iterrows():
         d = r.to_dict()
         items.append({
             "id": _clean(d.get("id")), "project": _clean(d.get("project")), "type": _clean(d.get("type")) or "Risk",
-            "description": _clean(d.get("description")), "rating": _rating(d), "owner": _clean(d.get("owner")),
+            "description": _clean(d.get("description")), "probability": _clean(d.get("probability")).capitalize(),
+            "impact": _clean(d.get("impact")).capitalize(), "rating": _rating(d), "owner": _clean(d.get("owner")),
             "action": _clean(d.get("action")), "due": _to_date(d.get("due")), "status": _clean(d.get("status")),
+            "visibility": _clean(d.get("visibility")) or "Client",
         })
+    return items
+
+
+def build_reports(tracker: dict, as_of: date) -> list[ClientReport]:
+    summary, ms = tracker["summary"], tracker["milestones"]
+    items = normalized_items(tracker)
     reports = []
     for _, s in summary.iterrows():
         project, client = _clean(s.get("project")), _clean(s.get("client"))
         if not project:
             continue
         mine = [i for i in items if _same_project(project, i["project"])]
+        mine_all = mine
+        mine = [i for i in mine_all if i["visibility"].lower() != "internal"]      # client reports never show Internal items
         open_ = [i for i in mine if i["status"].lower() not in CLOSED]
         warnings = []
 
@@ -247,13 +282,17 @@ def build_reports(tracker: dict, as_of: date) -> list[ClientReport]:
         week_end = as_of + timedelta(days=7)
         nxt = sorted([i for i in open_ if i["due"] and as_of <= i["due"] <= week_end], key=lambda i: i["due"])
 
+        progress = _clean(s.get("client_update"))
+        if not progress:
+            progress = (f"Phase: {_clean(s.get('phase'))}. " if _clean(s.get("phase")) else "") + (f"Main issue: {_clean(s.get('main_issue'))}" if _clean(s.get("main_issue")) else "")
+            warnings.append("No 'Client-facing update' text in the tracker, so the internal 'Main issue' text is used in the client report. Check it before sending.")
         reports.append(ClientReport(
             client=client or project, project=project, as_of=as_of, health=health, health_note=note,
             phase=_clean(s.get("phase")),
-            progress=(f"Phase: {_clean(s.get('phase'))}. " if _clean(s.get("phase")) else "")
-                     + (f"Main issue: {_clean(s.get('main_issue'))}" if _clean(s.get("main_issue")) else ""),
+            progress=progress,
             completed=completed, milestones=milestones, risks=major, overdue=overdue, blockers=blockers,
-            decisions=decisions, next_week=nxt, warnings=warnings))
+            decisions=decisions, next_week=nxt, warnings=warnings,
+            main_issue=_clean(s.get("main_issue")), all_items=mine_all))
     if not reports:
         raise TrackerError("The Summary sheet has no project rows.")
     return reports
@@ -280,30 +319,61 @@ def render_markdown(r: ClientReport) -> str:
 
 
 def render_html(r: ClientReport) -> str:
+    """A client-ready, print-friendly one-page report (open in a browser, Print > Save as PDF)."""
     e = html.escape
-    colour = {"Red": "#b00020", "Amber": "#b26a00", "Green": "#1b7a2f"}.get(r.health, "#444")
+    colour = {"Red": "#c62828", "Amber": "#ef8f00", "Green": "#2e7d32"}.get(r.health, "#546e7a")
+    soft = {"Red": "#fdecea", "Amber": "#fff4e0", "Green": "#e8f5e9"}.get(r.health, "#eceff1")
+    rate = {"High": "#c62828", "Medium": "#ef8f00", "Low": "#2e7d32"}
 
-    def ul(xs): return "<ul>" + "".join(f"<li>{x}</li>" for x in xs) + "</ul>" if xs else "<p>None.</p>"
+    def card(title, inner):
+        return f'<section class="card"><h2>{title}</h2>{inner}</section>'
+
+    def ul(xs):
+        return "<ul>" + "".join(f"<li>{x}</li>" for x in xs) + "</ul>" if xs else '<p class="muted">None.</p>'
 
     def table(head, rows):
         if not rows:
-            return "<p>None.</p>"
+            return '<p class="muted">None.</p>'
         return ("<table><tr>" + "".join(f"<th>{h}</th>" for h in head) + "</tr>"
-                + "".join("<tr>" + "".join(f"<td>{e(str(c))}</td>" for c in row) + "</tr>" for row in rows) + "</table>")
-    body = f"""<h1>Weekly Status Report – {e(r.client)}</h1>
-<p>Project: <b>{e(r.project)}</b> | As of {r.as_of:%a %d %b %Y}</p>
-<p>Project health: <span class="badge" style="background:{colour}">{r.health.upper()}</span></p>
-<h2>Progress summary</h2><p>{e(r.progress) or 'No summary provided.'}</p>
-<h2>Completed</h2>{ul([e(c) for c in r.completed])}
-<h2>Upcoming milestones</h2>{ul([f"<b>{fmt(m['date'])}</b> – {e(m['milestone'])}" + (' ⚠ overdue' if m['overdue'] else '') for m in r.milestones])}
-<h2>Major risks and issues</h2>{table(['Item','Rating','Owner','Action','Due'], [[f"{i['id']} {i['description']}", i['rating'], i['owner'], i['action'], fmt(i['due'])] for i in r.risks])}
-<h2>Blockers and dependencies</h2>{ul([e(b) for b in r.blockers])}
-{('<h2>Overdue actions</h2>' + ul([e(f"{i['id']} (due {fmt(i['due'])}, owner {i['owner']}): {i['action']}") for i in r.overdue])) if r.overdue else ''}
-<h2>Decisions required</h2>{ul([e(d) for d in r.decisions])}
-<h2>Next week's action plan</h2>{table(['Due','Action','Owner'], [[fmt(i['due']), f"{i['id']} – {i['action']}", i['owner']] for i in r.next_week])}"""
+                + "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in rows) + "</table>")
+
+    def pill(rating):
+        return f'<span class="pill" style="background:{rate.get(rating, "#546e7a")}">{e(rating)}</span>'
+
+    kpis = [("Major risks", len(r.risks)), ("Overdue actions", len(r.overdue)),
+            ("Decisions needed", len(r.decisions)), ("Actions next 7 days", len(r.next_week))]
+    kpi_html = "".join(f'<div class="kpi"><div class="n">{n}</div><div class="l">{l}</div></div>' for l, n in kpis)
+    risks_t = table(["Item", "Rating", "Owner", "Action", "Due"],
+                    [[f"<b>{e(i['id'])}</b> {e(i['description'])}", pill(i["rating"]), e(i["owner"]), e(i["action"]), fmt(i["due"])] for i in r.risks])
+    ms = ul([f"<b>{fmt(m['date'])}</b> – {e(m['milestone'])}" + (' <span class="late">overdue</span>' if m["overdue"] else "") for m in r.milestones])
+    nxt = table(["Due", "Action", "Owner"], [[fmt(i["due"]), f"<b>{e(i['id'])}</b> {e(i['action'])}", e(i["owner"])] for i in r.next_week])
+    overdue = card("Overdue actions", ul([e(f"{i['id']} – due {fmt(i['due'])}, owner {i['owner']}: {i['action']}") for i in r.overdue])) if r.overdue else ""
+    body = f"""
+<header style="border-left:8px solid {colour};background:{soft}">
+  <div><div class="eyebrow">Weekly status report</div><h1>{e(r.client)}</h1>
+  <div class="muted">Project: <b>{e(r.project)}</b> &nbsp;|&nbsp; Week of {r.as_of:%d %b %Y} &nbsp;|&nbsp; Phase: {e(r.phase) or '–'}</div></div>
+  <div class="health" style="background:{colour}">{r.health.upper()}</div>
+</header>
+<div class="kpis">{kpi_html}</div>
+{card("Progress summary", f"<p>{e(r.progress) or 'No summary provided.'}</p>")}
+<div class="two">{card("Completed", ul([e(c) for c in r.completed]))}{card("Upcoming milestones", ms)}</div>
+{card("Major risks and issues", risks_t)}
+<div class="two">{card("Blockers and dependencies", ul([e(b) for b in r.blockers]))}{card("Decisions required from you", ul([e(d) for d in r.decisions]))}</div>
+{overdue}
+{card("Next week's action plan", nxt)}
+<footer>Prepared by the Technical Program Manager, PanScience Innovations. Source: project tracker as of {r.as_of:%d %b %Y}.</footer>"""
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Status – {e(r.client)}</title><style>
-body{{font-family:Arial,sans-serif;max-width:900px;margin:24px auto;color:#1a1a1a;font-size:14px}}
-h1{{color:#0b2545}}h2{{color:#0b2545;border-bottom:1px solid #0b2545;padding-bottom:2px;margin-top:20px}}
-table{{border-collapse:collapse;width:100%}}th{{background:#0b2545;color:#fff;text-align:left;padding:4px 6px}}
-td{{border:1px solid #c9cfd8;padding:4px 6px;vertical-align:top}}.badge{{color:#fff;padding:2px 10px;border-radius:10px;font-weight:bold}}
-</style></head><body>{body}</body></html>"""
+*{{box-sizing:border-box}}body{{font-family:"Segoe UI",Arial,sans-serif;background:#f4f6f9;margin:0;padding:18px;color:#1f2933;font-size:13.5px}}
+.wrap{{max-width:980px;margin:auto}}header{{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-radius:10px;margin-bottom:12px}}
+.eyebrow{{text-transform:uppercase;letter-spacing:.08em;font-size:11px;color:#52606d}}h1{{margin:2px 0 4px;font-size:26px;color:#0b2545}}
+.health{{color:#fff;font-weight:700;font-size:20px;padding:10px 22px;border-radius:30px;letter-spacing:.05em}}
+.kpis{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px}}.kpi{{background:#fff;border-radius:10px;padding:10px 14px;box-shadow:0 1px 3px rgba(0,0,0,.08)}}
+.kpi .n{{font-size:26px;font-weight:700;color:#0b2545}}.kpi .l{{color:#52606d;font-size:12px}}
+.card{{background:#fff;border-radius:10px;padding:12px 16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.08)}}
+.card h2{{margin:0 0 6px;font-size:14px;color:#0b2545;text-transform:uppercase;letter-spacing:.05em}}.two{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
+table{{border-collapse:collapse;width:100%}}th{{text-align:left;font-size:11.5px;color:#52606d;border-bottom:2px solid #e4e7eb;padding:5px 6px}}
+td{{border-bottom:1px solid #eef0f3;padding:6px;vertical-align:top}}ul{{margin:4px 0 4px 18px;padding:0}}li{{margin:3px 0}}
+.pill{{color:#fff;border-radius:10px;padding:1px 9px;font-size:11.5px;font-weight:600}}.muted{{color:#7b8794}}.late{{color:#c62828;font-weight:600}}
+footer{{color:#7b8794;font-size:11.5px;text-align:center;margin-top:8px}}
+@media print{{body{{background:#fff;padding:0}}.card,.kpi{{box-shadow:none;border:1px solid #e4e7eb}}}}
+</style></head><body><div class="wrap">{body}</div></body></html>"""
